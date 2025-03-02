@@ -1,7 +1,7 @@
 #include "crc_utils.h"
 
-//CRC check table
-static uint16_t crc_table[256] = {
+// CRC lookup table for ISO14443A protocol (stored in flash memory)
+static const uint16_t __attribute__((aligned(4))) crc_table[256] = {
     0x0000, 0x1189, 0x2312, 0x329B, 0x4624, 0x57AD, 0x6536, 0x74BF,
     0x8C48, 0x9DC1, 0xAF5A, 0xBED3, 0xCA6C, 0xDBE5, 0xE97E, 0xF8F7,
     0x1081, 0x0108, 0x3393, 0x221A, 0x56A5, 0x472C, 0x75B7, 0x643E,
@@ -36,19 +36,32 @@ static uint16_t crc_table[256] = {
     0x7BC7, 0x6A4E, 0x58D5, 0x495C, 0x3DE3, 0x2C6A, 0x1EF1, 0x0F78,
 };
 
-
 /**
- * @brief Use the table check method on the MCU to calculate the CRC (CRC16) dedicated to the 144443A protocol.
- * @param data The original data of the calculated CRC
- * @param length The length of the data does not include CRC
- * @param output The output buffer must be greater than or equal to two bytes
- *
+ * @brief Calculate CRC16 for ISO14443A protocol using lookup table method
+ * @param data Pointer to input data buffer
+ * @param length Length of data in bytes
+ * @param output Pointer to output buffer (must be at least 2 bytes)
  */
 void calc_14a_crc_lut(uint8_t *data, int length, uint8_t *output) {
-    //Take the clever, compulsory pointer type conversion
-    uint16_t *crc = (uint16_t *)output;
-    //Give the initial value of polynomial
-    *crc = 0x6363;
-    //Then start checking the table of each byte
-    while (length--) *crc = (*crc >> 8) ^ crc_table[(*crc & 0xFF) ^ *data++];
+    // Use local variable for CRC to avoid multiple pointer dereferences
+    uint16_t crc = 0x6363; // Initial value for ISO14443A
+    
+    // Optimization for Cortex-M MCUs: process data in 4-byte blocks when possible
+    while (length >= 4) {
+        // Loop unrolling to reduce branching overhead
+        crc = (crc >> 8) ^ crc_table[(crc & 0xFF) ^ *data++];
+        crc = (crc >> 8) ^ crc_table[(crc & 0xFF) ^ *data++];
+        crc = (crc >> 8) ^ crc_table[(crc & 0xFF) ^ *data++];
+        crc = (crc >> 8) ^ crc_table[(crc & 0xFF) ^ *data++];
+        length -= 4;
+    }
+    
+    // Process remaining bytes
+    while (length--) {
+        crc = (crc >> 8) ^ crc_table[(crc & 0xFF) ^ *data++];
+    }
+    
+    // Write CRC to output buffer (little-endian)
+    output[0] = (uint8_t)(crc & 0xFF);
+    output[1] = (uint8_t)(crc >> 8);
 }
