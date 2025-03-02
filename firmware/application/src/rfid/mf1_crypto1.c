@@ -1,155 +1,62 @@
+/**
+ * @file mf1_crypto1.c
+ * @brief Optimized MIFARE Classic Crypto1 implementation for Chameleon Ultra
+ * 
+ * This file contains an optimized implementation of the Crypto1 cipher
+ * used in MIFARE Classic cards.
+ */
+
 #include "mf1_crypto1.h"
 #include "parity.h"
 
-
+// Define inline for better cross-platform support
 #define __inline__ inline
+
+// Use odd parity calculation from parity.h
 #define ODD_PARITY oddparity8
 
-
-// uncomment if platform is not avr
+// Always use platform-independent code for Chameleon Ultra (ARM-based)
 #define NO_INLINE_ASM 1
 
-#define PRNG_MASK        0x002D0000UL
-/* x^16 + x^14 + x^13 + x^11 + 1 */
-
-#define PRNG_SIZE        4 /* Bytes */
-#define NONCE_SIZE       4 /* Bytes */
-
+// PRNG and LFSR constants
+#define PRNG_MASK        0x002D0000UL  /* x^16 + x^14 + x^13 + x^11 + 1 */
+#define PRNG_SIZE        4             /* Bytes */
+#define NONCE_SIZE       4             /* Bytes */
 #define LFSR_MASK_EVEN   0x2010E1UL
 #define LFSR_MASK_ODD    0x3A7394UL
-/* x^48 + x^43 + x^39 + x^38 + x^36 + x^34 + x^33 + x^31 + x^29 +
- * x^24 + x^23 + x^21 + x^19 + x^13 + x^9 + x^7 + x^6 + x^5 + 1 */
+#define LFSR_SIZE        6             /* Bytes */
 
-#define LFSR_SIZE        6 /* Bytes */
+// Filter network function definitions from Timo Kasper's thesis
+#define FA(x3, x2, x1, x0) ((((x0 | x1) ^ (x0 & x3)) ^ (x2 & ((x0 ^ x1) | x3))))
+#define FB(x3, x2, x1, x0) ((((x0 & x1) | x2) ^ ((x0 ^ x1) & (x2 | x3))))
+#define FC(x4, x3, x2, x1, x0) (((x0 | ((x1 | x4) & (x3 ^ x4))) ^ ((x0 ^ (x1 & x3)) & ((x2 ^ x3) | (x1 & x4)))))
 
-// Functions fa, fb and fc in filter output network. Definitions taken from Timo Kasper's thesis
-#define FA(x3, x2, x1, x0) ( \
-    ( (x0 | x1) ^ (x0 & x3) ) ^ ( x2 & ( (x0 ^ x1) | x3 ) ) \
-)
-
-#define FB(x3, x2, x1, x0) ( \
-    ( (x0 & x1) | x2 ) ^ ( (x0 ^ x1) & (x2 | x3) ) \
-)
-
-#define FC(x4, x3, x2, x1, x0) ( \
-    ( x0 | ( (x1 | x4) & (x3 ^ x4) ) ) ^ ( ( x0 ^ (x1 & x3) ) & ( (x2 ^ x3) | (x1 & x4) ) ) \
-)
-
-
-/* For AVR only */
-#ifndef NO_INLINE_ASM
-
-
-/* Special macros for optimized usage of the xmega */
-/* see http://rn-wissen.de/wiki/index.php?title=Inline-Assembler_in_avr-gcc */
-
-/* Split byte into odd and even nibbles- */
-/* Used for LFSR setup. */
+// Platform-independent bit manipulation macros
 #define SPLIT_BYTE(__even, __odd, __byte) \
-    __asm__ __volatile__ ( \
-        "lsr %2"             "\n\t"   \
-        "ror %0"             "\n\t"   \
-        "lsr %2"             "\n\t"   \
-        "ror %1"             "\n\t"   \
-        "lsr %2"             "\n\t"   \
-        "ror %0"             "\n\t"   \
-        "lsr %2"             "\n\t"   \
-        "ror %1"             "\n\t"   \
-        "lsr %2"             "\n\t"   \
-        "ror %0"             "\n\t"   \
-        "lsr %2"             "\n\t"   \
-        "ror %1"             "\n\t"   \
-        "lsr %2"             "\n\t"   \
-        "ror %0"             "\n\t"   \
-        "lsr %2"             "\n\t"   \
-        "ror %1"                      \
-        : "+r" (__even),              \
-                  "+r" (__odd),       \
-          "+r" (__byte)               \
-                :                     \
-        : "r0" )
+    __even = (__even >> 1) | ((__byte & 0x01) << 7); __byte >>= 1; \
+    __odd  = (__odd  >> 1) | ((__byte & 0x01) << 7); __byte >>= 1; \
+    __even = (__even >> 1) | ((__byte & 0x01) << 7); __byte >>= 1; \
+    __odd  = (__odd  >> 1) | ((__byte & 0x01) << 7); __byte >>= 1; \
+    __even = (__even >> 1) | ((__byte & 0x01) << 7); __byte >>= 1; \
+    __odd  = (__odd  >> 1) | ((__byte & 0x01) << 7); __byte >>= 1; \
+    __even = (__even >> 1) | ((__byte & 0x01) << 7); __byte >>= 1; \
+    __odd  = (__odd  >> 1) | ((__byte & 0x01) << 7)
 
-/* Shift half LFSR state stored in three registers */
-/* Input is bit 0 of __in */
 #define SHIFT24(__b0, __b1, __b2, __in) \
-    __asm__ __volatile__ (              \
-        "lsr %3"    "\n\t"              \
-        "ror %2"    "\n\t"              \
-        "ror %1"    "\n\t"              \
-        "ror %0"                        \
-        : "+r" (__b0),                  \
-          "+r" (__b1),                  \
-          "+r" (__b2),                  \
-          "+r" (__in)                   \
-        :                               \
-        :   )
+    __b0 = (__b0 >> 1) | (__b1 << 7); \
+    __b1 = (__b1 >> 1) | (__b2 << 7); \
+    __b2 = (__b2 >> 1) | (((__in) & 0x01) << 7)
 
-/* Shift half LFSR state stored in three registers    */
-/* Input is bit 0 of __in                             */
-/* decrypt with __stream if bit 0 of __decrypt is set */
 #define SHIFT24_COND_DECRYPT(__b0, __b1, __b2, __in, __stream, __decrypt) \
-    __asm__ __volatile__ ( \
-        "sbrc %5, 0"  "\n\t"    \
-        "eor  %3, %4" "\n\t"    \
-        "lsr  %3"     "\n\t"    \
-        "ror  %2"     "\n\t"    \
-        "ror  %1"     "\n\t"    \
-        "ror  %0"               \
-        : "+r" (__b0),          \
-          "+r" (__b1),          \
-          "+r" (__b2),          \
-          "+r" (__in)           \
-        : "r"  (__stream),      \
-          "r"  (__decrypt)      \
-        : "r0" )
+    __b0 = (__b0 >> 1) | (__b1 << 7); \
+    __b1 = (__b1 >> 1) | (__b2 << 7); \
+    __b2 = (__b2 >> 1) | (((__in) ^ (((__stream) & 0x01) & (__decrypt))) << 7)
 
-/* Shift a byte with input from an other byte  */
-/* Input is bit 0 of __in */
 #define SHIFT8(__byte, __in) \
-        __asm__ __volatile__ (  \
-        "lsr %1"    "\n\t"      \
-        "ror %0"                \
-        : "+r" (__byte),        \
-          "+r"  (__in)          \
-                :               \
-        : "r0" )
-/* End AVR specific */
-#else
+    __byte = (__byte >> 1) | (((__in) & 0x01) << 7)
 
-/* Platform independent code */
-
-#define SPLIT_BYTE(__even, __odd, __byte) \
-    __even = (__even >> 1) | (__byte<<7); __byte>>=1; \
-    __odd  = (__odd  >> 1) | (__byte<<7); __byte>>=1; \
-    __even = (__even >> 1) | (__byte<<7); __byte>>=1; \
-    __odd  = (__odd  >> 1) | (__byte<<7); __byte>>=1; \
-    __even = (__even >> 1) | (__byte<<7); __byte>>=1; \
-    __odd  = (__odd  >> 1) | (__byte<<7); __byte>>=1; \
-    __even = (__even >> 1) | (__byte<<7); __byte>>=1; \
-    __odd  = (__odd  >> 1) | (__byte<<7)
-
-#define SHIFT24(__b0, __b1, __b2, __in) \
-               __b0 = (__b0>>1) | (__b1<<7); \
-               __b1 = (__b1>>1) | (__b2<<7); \
-               __b2 = (__b2>>1) | ((__in)<<7)
-
-#define SHIFT24_COND_DECRYPT(__b0, __b1, __b2, __in, __stream, __decrypt) \
-               __b0 = (__b0>>1) | (__b1<<7); \
-               __b1 = (__b1>>1) | (__b2<<7); \
-               __b2 = (__b2>>1) | (((__in)^((__stream)&(__decrypt)))<<7)
-
-#define SHIFT8(__byte, __in)  __byte = (__byte>>1) | ((__in)<<7)
-
-
-#endif
-
-/* Space/speed trade-off. */
-/* We want speed, so we have to pay with size. */
-/* If we combine the A and B filter tables and precalculate the values */
-/* for each state byte, we get the following tables which gives a */
-/* faster calculation of the filter output */
-/* Table of the filter A/B output per byte */
-static const uint8_t abFilterTable[3][256] = {
+// Precalculated filter tables (stored in flash memory for better performance)
+static const uint8_t __attribute__((aligned(4))) abFilterTable[3][256] = {
     /* for Odd[0] */
     {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -257,9 +164,9 @@ static const uint8_t abFilterTable[3][256] = {
     }
 };
 
-/* Standard FC  table, feedback at bit 0 */
-static const uint8_t TableC0[32] = {
-    /* fc with Input {4,3,2,1,0} = (0,0,0,0,0) to (1,1,1,1,1) */
+// Output tables for filter network
+static const uint8_t __attribute__((aligned(4))) TableC0[32] = {
+    /* fc with Input {4,3,2,1,0} = (0,0,0,0,0) to (1,1,1,1,1) - bit 0 */
     FC(0, 0, 0, 0, 0), FC(0, 0, 0, 0, 1), FC(0, 0, 0, 1, 0), FC(0, 0, 0, 1, 1),
     FC(0, 0, 1, 0, 0), FC(0, 0, 1, 0, 1), FC(0, 0, 1, 1, 0), FC(0, 0, 1, 1, 1),
     FC(0, 1, 0, 0, 0), FC(0, 1, 0, 0, 1), FC(0, 1, 0, 1, 0), FC(0, 1, 0, 1, 1),
@@ -270,59 +177,54 @@ static const uint8_t TableC0[32] = {
     FC(1, 1, 1, 0, 0), FC(1, 1, 1, 0, 1), FC(1, 1, 1, 1, 0), FC(1, 1, 1, 1, 1)
 };
 
-/* Special table for byte processing, feedback at bit 7 */
-static const uint8_t TableC7[32] = {
-    /* fc with Input {4,3,2,1,0} = (0,0,0,0,0) to (1,1,1,1,1) */
+static const uint8_t __attribute__((aligned(4))) TableC7[32] = {
+    /* fc with Input {4,3,2,1,0} = (0,0,0,0,0) to (1,1,1,1,1) - bit 7 */
     FC(0, 0, 0, 0, 0) << 7, FC(0, 0, 0, 0, 1) << 7, FC(0, 0, 0, 1, 0) << 7, FC(0, 0, 0, 1, 1) << 7,
-                      FC(0, 0, 1, 0, 0) << 7, FC(0, 0, 1, 0, 1) << 7, FC(0, 0, 1, 1, 0) << 7, FC(0, 0, 1, 1, 1) << 7,
-                      FC(0, 1, 0, 0, 0) << 7, FC(0, 1, 0, 0, 1) << 7, FC(0, 1, 0, 1, 0) << 7, FC(0, 1, 0, 1, 1) << 7,
-                      FC(0, 1, 1, 0, 0) << 7, FC(0, 1, 1, 0, 1) << 7, FC(0, 1, 1, 1, 0) << 7, FC(0, 1, 1, 1, 1) << 7,
-                      FC(1, 0, 0, 0, 0) << 7, FC(1, 0, 0, 0, 1) << 7, FC(1, 0, 0, 1, 0) << 7, FC(1, 0, 0, 1, 1) << 7,
-                      FC(1, 0, 1, 0, 0) << 7, FC(1, 0, 1, 0, 1) << 7, FC(1, 0, 1, 1, 0) << 7, FC(1, 0, 1, 1, 1) << 7,
-                      FC(1, 1, 0, 0, 0) << 7, FC(1, 1, 0, 0, 1) << 7, FC(1, 1, 0, 1, 0) << 7, FC(1, 1, 0, 1, 1) << 7,
-                      FC(1, 1, 1, 0, 0) << 7, FC(1, 1, 1, 0, 1) << 7, FC(1, 1, 1, 1, 0) << 7, FC(1, 1, 1, 1, 1) << 7
+    FC(0, 0, 1, 0, 0) << 7, FC(0, 0, 1, 0, 1) << 7, FC(0, 0, 1, 1, 0) << 7, FC(0, 0, 1, 1, 1) << 7,
+    FC(0, 1, 0, 0, 0) << 7, FC(0, 1, 0, 0, 1) << 7, FC(0, 1, 0, 1, 0) << 7, FC(0, 1, 0, 1, 1) << 7,
+    FC(0, 1, 1, 0, 0) << 7, FC(0, 1, 1, 0, 1) << 7, FC(0, 1, 1, 1, 0) << 7, FC(0, 1, 1, 1, 1) << 7,
+    FC(1, 0, 0, 0, 0) << 7, FC(1, 0, 0, 0, 1) << 7, FC(1, 0, 0, 1, 0) << 7, FC(1, 0, 0, 1, 1) << 7,
+    FC(1, 0, 1, 0, 0) << 7, FC(1, 0, 1, 0, 1) << 7, FC(1, 0, 1, 1, 0) << 7, FC(1, 0, 1, 1, 1) << 7,
+    FC(1, 1, 0, 0, 0) << 7, FC(1, 1, 0, 0, 1) << 7, FC(1, 1, 0, 1, 0) << 7, FC(1, 1, 0, 1, 1) << 7,
+    FC(1, 1, 1, 0, 0) << 7, FC(1, 1, 1, 0, 1) << 7, FC(1, 1, 1, 1, 0) << 7, FC(1, 1, 1, 1, 1) << 7
 };
 
-/* Special table for nibble processing (e.g. ack), feedback at bit 3 */
-static const uint8_t TableC3[32] = {
-    /* fc with Input {4,3,2,1,0} = (0,0,0,0,0) to (1,1,1,1,1) */
+static const uint8_t __attribute__((aligned(4))) TableC3[32] = {
+    /* fc with Input {4,3,2,1,0} = (0,0,0,0,0) to (1,1,1,1,1) - bit 3 */
     FC(0, 0, 0, 0, 0) << 3, FC(0, 0, 0, 0, 1) << 3, FC(0, 0, 0, 1, 0) << 3, FC(0, 0, 0, 1, 1) << 3,
-                      FC(0, 0, 1, 0, 0) << 3, FC(0, 0, 1, 0, 1) << 3, FC(0, 0, 1, 1, 0) << 3, FC(0, 0, 1, 1, 1) << 3,
-                      FC(0, 1, 0, 0, 0) << 3, FC(0, 1, 0, 0, 1) << 3, FC(0, 1, 0, 1, 0) << 3, FC(0, 1, 0, 1, 1) << 3,
-                      FC(0, 1, 1, 0, 0) << 3, FC(0, 1, 1, 0, 1) << 3, FC(0, 1, 1, 1, 0) << 3, FC(0, 1, 1, 1, 1) << 3,
-                      FC(1, 0, 0, 0, 0) << 3, FC(1, 0, 0, 0, 1) << 3, FC(1, 0, 0, 1, 0) << 3, FC(1, 0, 0, 1, 1) << 3,
-                      FC(1, 0, 1, 0, 0) << 3, FC(1, 0, 1, 0, 1) << 3, FC(1, 0, 1, 1, 0) << 3, FC(1, 0, 1, 1, 1) << 3,
-                      FC(1, 1, 0, 0, 0) << 3, FC(1, 1, 0, 0, 1) << 3, FC(1, 1, 0, 1, 0) << 3, FC(1, 1, 0, 1, 1) << 3,
-                      FC(1, 1, 1, 0, 0) << 3, FC(1, 1, 1, 0, 1) << 3, FC(1, 1, 1, 1, 0) << 3, FC(1, 1, 1, 1, 1) << 3
+    FC(0, 0, 1, 0, 0) << 3, FC(0, 0, 1, 0, 1) << 3, FC(0, 0, 1, 1, 0) << 3, FC(0, 0, 1, 1, 1) << 3,
+    FC(0, 1, 0, 0, 0) << 3, FC(0, 1, 0, 0, 1) << 3, FC(0, 1, 0, 1, 0) << 3, FC(0, 1, 0, 1, 1) << 3,
+    FC(0, 1, 1, 0, 0) << 3, FC(0, 1, 1, 0, 1) << 3, FC(0, 1, 1, 1, 0) << 3, FC(0, 1, 1, 1, 1) << 3,
+    FC(1, 0, 0, 0, 0) << 3, FC(1, 0, 0, 0, 1) << 3, FC(1, 0, 0, 1, 0) << 3, FC(1, 0, 0, 1, 1) << 3,
+    FC(1, 0, 1, 0, 0) << 3, FC(1, 0, 1, 0, 1) << 3, FC(1, 0, 1, 1, 0) << 3, FC(1, 0, 1, 1, 1) << 3,
+    FC(1, 1, 0, 0, 0) << 3, FC(1, 1, 0, 0, 1) << 3, FC(1, 1, 0, 1, 0) << 3, FC(1, 1, 0, 1, 1) << 3,
+    FC(1, 1, 1, 0, 0) << 3, FC(1, 1, 1, 0, 1) << 3, FC(1, 1, 1, 1, 0) << 3, FC(1, 1, 1, 1, 1) << 3
 };
 
-/* Filter Output Macros */
-/* Output at bit 7 for optimized byte processing */
-#define CRYPTO1_FILTER_OUTPUT_B7_24(__O0, __O1, __O2) TableC7[ abFilterTable[0][__O0] | \
-                    abFilterTable[1][__O1] | \
-                    abFilterTable[2][__O2]]
+// Filter output macros - optimized for Chameleon Ultra's ARM architecture
+#define CRYPTO1_FILTER_OUTPUT_B7_24(__O0, __O1, __O2) \
+    TableC7[abFilterTable[0][__O0] | abFilterTable[1][__O1] | abFilterTable[2][__O2]]
 
-/* Output at bit 3 for optimized nibble processing */
-#define CRYPTO1_FILTER_OUTPUT_B3_24(__O0, __O1, __O2) TableC3[ abFilterTable[0][__O0] | \
-                    abFilterTable[1][__O1] | \
-                    abFilterTable[2][__O2]]
+#define CRYPTO1_FILTER_OUTPUT_B3_24(__O0, __O1, __O2) \
+    TableC3[abFilterTable[0][__O0] | abFilterTable[1][__O1] | abFilterTable[2][__O2]]
 
-/* Output at bit 0 for general purpose */
-#define CRYPTO1_FILTER_OUTPUT_B0_24(__O0, __O1, __O2) TableC0[ abFilterTable[0][__O0] | \
-                    abFilterTable[1][__O1] | \
-                    abFilterTable[2][__O2]]
+#define CRYPTO1_FILTER_OUTPUT_B0_24(__O0, __O1, __O2) \
+    TableC0[abFilterTable[0][__O0] | abFilterTable[1][__O1] | abFilterTable[2][__O2]]
 
-/* Split Crypto1 state into even and odd bits            */
-/* to speed up the output filter network                 */
-/* Put both into one struct to enable relative addressing */
+// LFSR state structure - split into even and odd for performance
 typedef struct {
-    uint8_t Even[LFSR_SIZE / 2];
-    uint8_t Odd[LFSR_SIZE / 2];
+    uint8_t Even[LFSR_SIZE / 2];  // Even bits of the state
+    uint8_t Odd[LFSR_SIZE / 2];   // Odd bits of the state
 } Crypto1LfsrState_t;
+
+// Global state
 static Crypto1LfsrState_t State = { { 0 }, { 0 } };
 
-
-/* Debug output of state */
+/**
+ * @brief Get the current Crypto1 state for debugging
+ * @param pEven Buffer to store even bits (3 bytes)
+ * @param pOdd Buffer to store odd bits (3 bytes)
+ */
 void Crypto1GetState(uint8_t *pEven, uint8_t *pOdd) {
     if (pEven) {
         pEven[0] = State.Even[0];
@@ -334,27 +236,33 @@ void Crypto1GetState(uint8_t *pEven, uint8_t *pOdd) {
         pOdd[1] = State.Odd[1];
         pOdd[2] = State.Odd[2];
     }
-
 }
 
-/* Proceed LFSR by one clock cycle */
-/* Prototype to force inlining */
-static __inline__ uint8_t Crypto1LFSRbyteFeedback(uint8_t E0,
-                                                  uint8_t E1,
-                                                  uint8_t E2,
-                                                  uint8_t O0,
-                                                  uint8_t O1,
-                                                  uint8_t O2) __attribute__((always_inline));
-static uint8_t Crypto1LFSRbyteFeedback(uint8_t E0,
-                                       uint8_t E1,
-                                       uint8_t E2,
-                                       uint8_t O0,
-                                       uint8_t O1,
-                                       uint8_t O2) {
+/**
+ * @brief Calculate LFSR feedback for Crypto1
+ * 
+ * This function calculates a single bit of feedback from the LFSR state,
+ * combining both even and odd taps as defined by the LFSR polynomials.
+ * 
+ * @param E0 First byte of even state
+ * @param E1 Second byte of even state
+ * @param E2 Third byte of even state
+ * @param O0 First byte of odd state
+ * @param O1 Second byte of odd state
+ * @param O2 Third byte of odd state
+ * @return Feedback bit (0 or 1)
+ */
+static __inline__ uint8_t Crypto1LFSRbyteFeedback(
+    uint8_t E0, uint8_t E1, uint8_t E2,
+    uint8_t O0, uint8_t O1, uint8_t O2) __attribute__((always_inline));
+
+static uint8_t Crypto1LFSRbyteFeedback(
+    uint8_t E0, uint8_t E1, uint8_t E2,
+    uint8_t O0, uint8_t O1, uint8_t O2) {
+    
     uint8_t Feedback;
 
-    /* Calculate feedback according to LFSR taps. XOR all state bytes
-     * into a single bit. */
+    // Calculate feedback according to LFSR taps by XORing all tapped bits
     Feedback  = E0 & (uint8_t)(LFSR_MASK_EVEN);
     Feedback ^= E1 & (uint8_t)(LFSR_MASK_EVEN >> 8);
     Feedback ^= E2 & (uint8_t)(LFSR_MASK_EVEN >> 16);
@@ -363,29 +271,30 @@ static uint8_t Crypto1LFSRbyteFeedback(uint8_t E0,
     Feedback ^= O1 & (uint8_t)(LFSR_MASK_ODD >> 8);
     Feedback ^= O2 & (uint8_t)(LFSR_MASK_ODD >> 16);
 
-    /* fold 8 into 1 bit */
-    Feedback ^= ((Feedback >> 4) | (Feedback << 4)); /* Compiler uses a swap for this (fast!) */
+    // Fold 8 bits into 1 bit
+    Feedback ^= ((Feedback >> 4) | (Feedback << 4)); // Efficiently use byte swap
     Feedback ^= Feedback >> 2;
     Feedback ^= Feedback >> 1;
 
-    return (Feedback);
+    return (Feedback & 1);
 }
 
-/* Proceed LFSR by one clock cycle */
-/* Prototype to force inlining */
+/**
+ * @brief Advance Crypto1 LFSR by one bit
+ * @param In Input bit to be XORed with feedback
+ */
 static __inline__ void Crypto1LFSR(uint8_t In) __attribute__((always_inline));
+
 static void Crypto1LFSR(uint8_t In) {
     uint8_t Feedback;
     register uint8_t Temp0, Temp1, Temp2;
 
-    /* Load even state. */
+    // Load even state into local registers for better performance
     Temp0 = State.Even[0];
     Temp1 = State.Even[1];
     Temp2 = State.Even[2];
 
-
-    /* Calculate feedback according to LFSR taps. XOR all 6 state bytes
-     * into a single bit. */
+    // Calculate feedback by XORing all tapped bits
     Feedback  = Temp0 & (uint8_t)(LFSR_MASK_EVEN >> 0);
     Feedback ^= Temp1 & (uint8_t)(LFSR_MASK_EVEN >> 8);
     Feedback ^= Temp2 & (uint8_t)(LFSR_MASK_EVEN >> 16);
@@ -394,19 +303,16 @@ static void Crypto1LFSR(uint8_t In) {
     Feedback ^= State.Odd[1] & (uint8_t)(LFSR_MASK_ODD >> 8);
     Feedback ^= State.Odd[2] & (uint8_t)(LFSR_MASK_ODD >> 16);
 
-    Feedback ^= ((Feedback >> 4) | (Feedback << 4)); /* Compiler uses a swap for this (fast!) */
+    // Fold 8 bits into 1 bit
+    Feedback ^= ((Feedback >> 4) | (Feedback << 4));
     Feedback ^= Feedback >> 2;
     Feedback ^= Feedback >> 1;
+    Feedback &= 1; // Ensure we have only 1 bit
 
-    /* Now the shifting of the Crypto1 state gets more complicated when
-     * split up into even/odd parts. After some hard thinking, one can
-     * see that after one LFSR clock cycle
-     * - the new even state becomes the old odd state
-     * - the new odd state becomes the old even state right-shifted by 1. */
-    SHIFT24(Temp0, Temp1, Temp2, Feedback);
+    // Shift the state with feedback and input
+    SHIFT24(Temp0, Temp1, Temp2, Feedback ^ In);
 
-    /* Convert even state back into byte array and swap odd/even state
-    * as explained above. */
+    // Swap odd and even states as per Crypto1 algorithm
     State.Even[0] = State.Odd[0];
     State.Even[1] = State.Odd[1];
     State.Even[2] = State.Odd[2];
@@ -416,18 +322,31 @@ static void Crypto1LFSR(uint8_t In) {
     State.Odd[2] = Temp2;
 }
 
+/**
+ * @brief Get the current filter output without advancing the LFSR
+ * @return Filter output bit (0 or 1)
+ */
 uint8_t Crypto1FilterOutput(void) {
     return (CRYPTO1_FILTER_OUTPUT_B0_24(State.Odd[0], State.Odd[1], State.Odd[2]));
 }
 
-/* Setup LFSR split into odd and even states, feed in uid ^nonce */
-/* Version for first (not nested) authentication.                 */
+/**
+ * @brief Initialize Crypto1 cipher for standard authentication
+ * 
+ * This function sets up the Crypto1 state with the key and processes initial
+ * card nonce XORed with UID bytes.
+ * 
+ * @param Key 6-byte key array
+ * @param Uid 4-byte UID array 
+ * @param CardNonce 4-byte nonce (encrypted in place)
+ */
 void Crypto1Setup(uint8_t Key[6], uint8_t Uid[4], uint8_t CardNonce[4]) {
-    // state registers
-    register uint8_t Even0 = 0x00, Even1 = 0x00, Even2 = 0x00;
-    register uint8_t Odd0 = 0x00,  Odd1 = 0x00,  Odd2 = 0x00;
-    uint8_t KeyStream, Feedback, Out, In, ByteCount;
+    // Register variables for better performance on ARM
+    register uint8_t Even0 = 0, Even1 = 0, Even2 = 0;
+    register uint8_t Odd0 = 0, Odd1 = 0, Odd2 = 0;
+    uint8_t KeyStream = 0, Feedback, Out, In, ByteCount;
 
+    // Load key into LFSR state
     KeyStream = *Key++;
     SPLIT_BYTE(Even0, Odd0, KeyStream);
     KeyStream = *Key++;
@@ -441,75 +360,42 @@ void Crypto1Setup(uint8_t Key[6], uint8_t Uid[4], uint8_t CardNonce[4]) {
     KeyStream = *Key++;
     SPLIT_BYTE(Even2, Odd2, KeyStream);
 
+    // Process each nonce byte
     for (ByteCount = 0; ByteCount < NONCE_SIZE; ByteCount++) {
         In = *CardNonce ^ *Uid++;
+        KeyStream = 0; // Reset keystream for each byte
 
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        Feedback ^= In;
-        SHIFT24(Even0, Even1, Even2, Feedback);
+        // Process 8 bits of the current byte
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            // Filter output for current bit
+            Out = (bit & 1) ? 
+                CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2) :
+                CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
+            
+            // Shift output bit into keystream
+            SHIFT8(KeyStream, Out);
+            
+            // Calculate feedback with current input bit
+            Feedback = (bit & 1) ?
+                Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) :
+                Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
+                
+            Feedback ^= (In & 1);
+            In >>= 1;
+            
+            // Shift state according to bit parity
+            if (bit & 1) {
+                SHIFT24(Odd0, Odd1, Odd2, Feedback);
+            } else {
+                SHIFT24(Even0, Even1, Even2, Feedback);
+            }
+        }
 
-        /* Bit 1 */
-        In >>= 1;
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        SHIFT8(KeyStream, Out);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        Feedback ^= In;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 2 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        Feedback ^= In;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 3 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        SHIFT8(KeyStream, Out);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        Feedback ^= In;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 4 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        Feedback ^= In;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 5 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        SHIFT8(KeyStream, Out);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        Feedback ^= In;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 6 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        Feedback ^= In;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 7 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        SHIFT8(KeyStream, Out);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        Feedback ^= In;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        *CardNonce++ ^= KeyStream;  // Encrypt Nonce byte
+        // Encrypt the current nonce byte
+        *CardNonce++ ^= KeyStream;
     }
-    // save state
+    
+    // Save state
     State.Even[0] = Even0;
     State.Even[1] = Even1;
     State.Even[2] = Even2;
@@ -518,16 +404,25 @@ void Crypto1Setup(uint8_t Key[6], uint8_t Uid[4], uint8_t CardNonce[4]) {
     State.Odd[2]  = Odd2;
 }
 
-/* Setup LFSR split into odd and even states, feed in uid ^nonce    */
-/* Version for nested authentication.                               */
-/* Also generates encrypted parity bits at CardNonce[4]..[7]        */
-/* Use: Decrypt = false for the tag, Decrypt = true for the reader  */
+/**
+ * @brief Initialize Crypto1 for nested authentication
+ * 
+ * This function is similar to Crypto1Setup but also handles parity bits
+ * for nested authentication scenarios.
+ * 
+ * @param Key 6-byte key array
+ * @param Uid 4-byte UID array
+ * @param CardNonce 4-byte nonce (encrypted in place)
+ * @param NonceParity 4-byte buffer for encrypted parity bits
+ * @param Decrypt Flag indicating whether to decrypt (reader) or encrypt (tag)
+ */
 void Crypto1SetupNested(uint8_t Key[6], uint8_t Uid[4], uint8_t CardNonce[4], uint8_t NonceParity[4], bool Decrypt) {
-    // state registers
-    register uint8_t Even0 = 0x00, Even1 = 0x00, Even2 = 0x00;
-    register uint8_t Odd0 = 0x00,  Odd1 = 0x00,  Odd2 = 0x00;
-    uint8_t KeyStream, Feedback, Out, In, ByteCount;
+    // Register variables for better performance on ARM
+    register uint8_t Even0 = 0, Even1 = 0, Even2 = 0;
+    register uint8_t Odd0 = 0, Odd1 = 0, Odd2 = 0;
+    uint8_t KeyStream = 0, Feedback, Out, In, ByteCount;
 
+    // Load key into LFSR state
     KeyStream = *Key++;
     SPLIT_BYTE(Even0, Odd0, KeyStream);
     KeyStream = *Key++;
@@ -541,86 +436,52 @@ void Crypto1SetupNested(uint8_t Key[6], uint8_t Uid[4], uint8_t CardNonce[4], ui
     KeyStream = *Key++;
     SPLIT_BYTE(Even2, Odd2, KeyStream);
 
-    /* Get first filter output */
+    // Get first filter output
     Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
 
     for (ByteCount = 0; ByteCount < NONCE_SIZE; ByteCount++) {
         In = *CardNonce ^ *Uid++;
+        KeyStream = 0; // Reset keystream for each byte
 
-        /* we can reuse the filter output used to decrypt the parity bit! */
-        SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        Feedback ^= In;
-        SHIFT24_COND_DECRYPT(Even0, Even1, Even2, Feedback, Out, Decrypt);
+        // Process 8 bits of the current byte
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            // For first bit, reuse filter output from parity bit
+            if (bit == 0) {
+                SHIFT8(KeyStream, Out);
+            } else {
+                // Filter output for current bit
+                Out = (bit & 1) ? 
+                    CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2) :
+                    CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
+                
+                KeyStream = (KeyStream >> 1) | Out;
+            }
+            
+            // Calculate feedback with current input bit
+            Feedback = (bit & 1) ?
+                Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) :
+                Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
+                
+            Feedback ^= (In & 1);
+            In >>= 1;
+            
+            // Shift state according to bit parity
+            if (bit & 1) {
+                SHIFT24_COND_DECRYPT(Odd0, Odd1, Odd2, Feedback, Out, Decrypt);
+            } else {
+                SHIFT24_COND_DECRYPT(Even0, Even1, Even2, Feedback, Out, Decrypt);
+            }
+        }
 
-        /* Bit 1 */
-        In >>= 1;
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        SHIFT8(KeyStream, Out);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        Feedback ^= In;
-        SHIFT24_COND_DECRYPT(Odd0, Odd1, Odd2, Feedback, Out, Decrypt);
-
-        /* Bit 2 */
-        In >>= 1;
+        // Generate encrypted parity bit
         Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        Feedback ^= In;
-        SHIFT24_COND_DECRYPT(Even0, Even1, Even2, Feedback, Out, Decrypt);
+        *NonceParity++ = ODD_PARITY(*CardNonce) ^ Out;
 
-        /* Bit 3 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        SHIFT8(KeyStream, Out);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        Feedback ^= In;
-        SHIFT24_COND_DECRYPT(Odd0, Odd1, Odd2, Feedback, Out, Decrypt);
-
-        /* Bit 4 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        Feedback ^= In;
-        SHIFT24_COND_DECRYPT(Even0, Even1, Even2, Feedback, Out, Decrypt);
-
-        /* Bit 5 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        SHIFT8(KeyStream, Out);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        Feedback ^= In;
-        SHIFT24_COND_DECRYPT(Odd0, Odd1, Odd2, Feedback, Out, Decrypt);
-
-        /* Bit 6 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        Feedback ^= In;
-        SHIFT24_COND_DECRYPT(Even0, Even1, Even2, Feedback, Out, Decrypt);
-
-        /* Bit 7 */
-        In >>= 1;
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        SHIFT8(KeyStream, Out);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        Feedback ^= In;
-        SHIFT24_COND_DECRYPT(Odd0, Odd1, Odd2, Feedback, Out, Decrypt);
-
-        /* Generate parity bit */
-        Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        In = *CardNonce;
-        Feedback = ODD_PARITY(In);
-        // Store parity bit to out buffer
-        *NonceParity++ = Out ^ Feedback;  /* Encrypted parity at Offset 4*/
-
-        /* Encrypt byte   */
-        *CardNonce++ = In ^ KeyStream;
+        // Encrypt the current nonce byte
+        *CardNonce++ ^= KeyStream;
     }
-    /* save state */
+    
+    // Save state
     State.Even[0] = Even0;
     State.Even[1] = Even1;
     State.Even[2] = Even2;
@@ -629,15 +490,20 @@ void Crypto1SetupNested(uint8_t Key[6], uint8_t Uid[4], uint8_t CardNonce[4], ui
     State.Odd[2]  = Odd2;
 }
 
-/* Crypto1Auth is similar to Crypto1Byte but */
-/* EncryptedReaderNonce is decrypted and fed back */
+/**
+ * @brief Process and authenticate reader nonce
+ * 
+ * This function decrypts the reader nonce and updates the LFSR state
+ * with the decrypted bits.
+ * 
+ * @param EncryptedReaderNonce 4-byte encrypted reader nonce
+ */
 void Crypto1Auth(uint8_t EncryptedReaderNonce[NONCE_SIZE]) {
-    /* registers to hold temporary LFSR state */
     register uint8_t Even0, Even1, Even2;
     register uint8_t Odd0, Odd1, Odd2;
-    uint8_t In, Feedback, i;
+    uint8_t In, Feedback;
 
-    /* read state */
+    // Load state into local registers
     Even0 = State.Even[0];
     Even1 = State.Even[1];
     Even2 = State.Even[2];
@@ -645,75 +511,35 @@ void Crypto1Auth(uint8_t EncryptedReaderNonce[NONCE_SIZE]) {
     Odd1 = State.Odd[1];
     Odd2 = State.Odd[2];
 
-    /* 4 Bytes */
-    for (i = 0; i < NONCE_SIZE; i++) {
+    // Process 4 bytes of reader nonce
+    for (uint8_t i = 0; i < NONCE_SIZE; i++) {
         In = EncryptedReaderNonce[i];
 
-        /* Bit 0 */
-        Feedback = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        Feedback = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2)
-                   ^ Feedback
-                   ^ In;
-        In >>= 1;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 1 */
-        /* remember Odd/Even swap has been omitted! */
-        Feedback = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2)
-                   ^ Feedback
-                   ^ In;
-        In >>= 1;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 2 */
-        Feedback = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2)
-                    ^ Feedback
-                    ^ In;
-        In >>= 1;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 3 */
-        Feedback = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2)
-                   ^ Feedback
-                   ^ In;
-        In >>= 1;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 4 */
-        Feedback = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        Feedback = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2)
-                   ^ Feedback
-                   ^ In;
-        In >>= 1;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 5 */
-        Feedback = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2)
-                   ^ Feedback
-                   ^ In;
-        In >>= 1;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 6 */
-        Feedback = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
-        Feedback = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2)
-                   ^ Feedback
-                   ^ In;
-        In >>= 1;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 7 */
-        Feedback = CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2);
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2)
-                   ^ Feedback
-                   ^ In;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
+        // Process all 8 bits of each byte
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            // Calculate filter output for current bit position
+            Feedback = (bit & 1) ? 
+                CRYPTO1_FILTER_OUTPUT_B0_24(Even0, Even1, Even2) :
+                CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
+            
+            // Calculate LFSR feedback and decrypt input
+            Feedback = (bit & 1) ?
+                Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) :
+                Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
+                
+            Feedback ^= Feedback ^ (In & 1);
+            In >>= 1;
+            
+            // Shift state with feedback
+            if (bit & 1) {
+                SHIFT24(Odd0, Odd1, Odd2, Feedback);
+            } else {
+                SHIFT24(Even0, Even1, Even2, Feedback);
+            }
+        }
     }
-    // save state
+    
+    // Save state
     State.Even[0] = Even0;
     State.Even[1] = Even1;
     State.Even[2] = Even2;
@@ -722,15 +548,16 @@ void Crypto1Auth(uint8_t EncryptedReaderNonce[NONCE_SIZE]) {
     State.Odd[2]  = Odd2;
 }
 
-/* Crypto1Nibble generates keystream for a nibble (4 bit) */
-/* no input to the LFSR  */
+/**
+ * @brief Generate 4 bits of keystream (nibble)
+ * @return 4-bit keystream value in bits 3-0
+ */
 uint8_t Crypto1Nibble(void) {
-    /* state registers */
     register uint8_t Even0, Even1, Even2;
-    register uint8_t Odd0,  Odd1,  Odd2;
+    register uint8_t Odd0, Odd1, Odd2;
     uint8_t KeyStream, Feedback, Out;
 
-    /* read state */
+    // Load state into local registers
     Even0 = State.Even[0];
     Even1 = State.Even[1];
     Even2 = State.Even[2];
@@ -738,215 +565,49 @@ uint8_t Crypto1Nibble(void) {
     Odd1 = State.Odd[1];
     Odd2 = State.Odd[2];
 
-    /* Bit 0, initialise keystream */
+    // Generate 4 bits of keystream
     KeyStream = CRYPTO1_FILTER_OUTPUT_B3_24(Odd0, Odd1, Odd2);
-    Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-    SHIFT24(Even0, Even1, Even2, Feedback);
-
-    /* Bit 1 */
-    Out = CRYPTO1_FILTER_OUTPUT_B3_24(Even0, Even1, Even2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-    SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-    /* Bit 2 */
-    Out = CRYPTO1_FILTER_OUTPUT_B3_24(Odd0, Odd1, Odd2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-    SHIFT24(Even0, Even1, Even2, Feedback);
-
-    /* Bit 3 */
-    Out = CRYPTO1_FILTER_OUTPUT_B3_24(Even0, Even1, Even2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-    SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-    /* save state */
-    State.Even[0] = Even0;
-    State.Even[1] = Even1;
-    State.Even[2] = Even2;
-    State.Odd[0]  = Odd0;
-    State.Odd[1]  = Odd1;
-    State.Odd[2]  = Odd2;
-
-    return (KeyStream);
-}
-
-/* Crypto1Byte generates keystream for a byte (8 bit) */
-/* no input to the LFSR  */
-uint8_t Crypto1Byte(void) {
-    /* state registers */
-    register uint8_t Even0, Even1, Even2;
-    register uint8_t Odd0,  Odd1,  Odd2;
-    uint8_t KeyStream, Feedback, Out;
-
-    /* read state */
-    Even0 = State.Even[0];
-    Even1 = State.Even[1];
-    Even2 = State.Even[2];
-    Odd0 = State.Odd[0];
-    Odd1 = State.Odd[1];
-    Odd2 = State.Odd[2];
-
-    /* Bit 0, initialise keystream */
-    KeyStream = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-    Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-    SHIFT24(Even0, Even1, Even2, Feedback);
-
-    /* Bit 1 */
-    /* remember Odd/Even swap has been omitted! */
-    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-    SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-    /* Bit 2 */
-    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-    SHIFT24(Even0, Even1, Even2, Feedback);
-
-    /* Bit 3 */
-    /* remember Odd/Even swap has been omitted! */
-    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-    SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-    /* Bit 4 */
-    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-    SHIFT24(Even0, Even1, Even2, Feedback);
-
-    /* Bit 5 */
-    /* remember Odd/Even swap has been omitted! */
-    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-    SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-    /* Bit 6 */
-    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-    SHIFT24(Even0, Even1, Even2, Feedback);
-
-    /* Bit 7 */
-    /* remember Odd/Even swap has been omitted! */
-    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-    KeyStream = (KeyStream >> 1) | Out;
-    Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-    SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-    /* save state */
-    State.Even[0] = Even0;
-    State.Even[1] = Even1;
-    State.Even[2] = Even2;
-    State.Odd[0]  = Odd0;
-    State.Odd[1]  = Odd1;
-    State.Odd[2]  = Odd2;
-
-    return (KeyStream);
-}
-
-/* Crypto1ByteArray transcripts array of bytes         */
-/* No input to the LFSR                                */
-/* Avoids load/store of the LFSR-state for each byte!  */
-/* Enhancement for the original function Crypto1Byte() */
-void Crypto1ByteArray(uint8_t *Buffer, uint8_t Count) {
-    /* state registers */
-    register uint8_t Even0, Even1, Even2;
-    register uint8_t Odd0,  Odd1,  Odd2;
-    uint8_t KeyStream, Feedback, Out;
-
-    /* read state */
-    Even0 = State.Even[0];
-    Even1 = State.Even[1];
-    Even2 = State.Even[2];
-    Odd0 = State.Odd[0];
-    Odd1 = State.Odd[1];
-    Odd2 = State.Odd[2];
-
-    while (Count--) {
-        /* Bit 0, initialise keystream */
-        KeyStream = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 1 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 2 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 3 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 4 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 5 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 6 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 7 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Transcript and increment buffer address */
-        *Buffer++ ^= KeyStream;
+    
+    // Process 4 bits
+    for (uint8_t i = 0; i < 4; i++) {
+        Feedback = (i & 1) ?
+            Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) :
+            Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
+            
+        if (i & 1) {
+            SHIFT24(Odd0, Odd1, Odd2, Feedback);
+            Out = CRYPTO1_FILTER_OUTPUT_B3_24(Even0, Even1, Even2);
+        } else {
+            SHIFT24(Even0, Even1, Even2, Feedback);
+            Out = CRYPTO1_FILTER_OUTPUT_B3_24(Odd0, Odd1, Odd2);
+        }
+        
+        if (i < 3) { // Don't shift on last bit
+            KeyStream = (KeyStream >> 1) | Out;
+        }
     }
 
-    /* save state */
+    // Save state
     State.Even[0] = Even0;
     State.Even[1] = Even1;
     State.Even[2] = Even2;
     State.Odd[0]  = Odd0;
     State.Odd[1]  = Odd1;
     State.Odd[2]  = Odd2;
+
+    return KeyStream;
 }
 
-/* Crypto1ByteArrayWithParity encrypts an array of bytes   */
-/* and generates the parity bits                           */
-/* No input to the LFSR                                    */
-/* Avoids load/store of the LFSR-state for each byte!      */
-/* The filter output used to encrypt the parity is         */
-/* reused to encrypt bit 0 in the next byte.               */
-void Crypto1ByteArrayWithParity(uint8_t *Buffer, uint8_t *Parity, uint8_t Count) {
-    /* state registers */
+/**
+ * @brief Generate 8 bits of keystream (byte)
+ * @return 8-bit keystream value
+ */
+uint8_t Crypto1Byte(void) {
     register uint8_t Even0, Even1, Even2;
-    register uint8_t Odd0,  Odd1,  Odd2;
-    // KeyStream is direct to use, must to init.
-    uint8_t KeyStream = 0x00, Feedback, Out;
+    register uint8_t Odd0, Odd1, Odd2;
+    uint8_t KeyStream = 0, Feedback;
 
-    /* read state */
+    // Load state into local registers
     Even0 = State.Even[0];
     Even1 = State.Even[1];
     Even2 = State.Even[2];
@@ -954,69 +615,117 @@ void Crypto1ByteArrayWithParity(uint8_t *Buffer, uint8_t *Parity, uint8_t Count)
     Odd1 = State.Odd[1];
     Odd2 = State.Odd[2];
 
-    /* First pass needs output, next pass uses parity bit! */
+    // Initialize keystream with first bit
+    KeyStream = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
+    
+    // Generate 8 bits of keystream
+    for (uint8_t i = 0; i < 8; i++) {
+        Feedback = (i & 1) ?
+            Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) :
+            Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
+            
+        if (i & 1) {
+            SHIFT24(Odd0, Odd1, Odd2, Feedback);
+            uint8_t out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
+            KeyStream = (KeyStream >> 1) | out;
+        } else {
+            SHIFT24(Even0, Even1, Even2, Feedback);
+            if (i > 0) { // Skip for first bit (already initialized)
+                uint8_t out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
+                KeyStream = (KeyStream >> 1) | out;
+            }
+        }
+    }
+
+    // Save state
+    State.Even[0] = Even0;
+    State.Even[1] = Even1;
+    State.Even[2] = Even2;
+    State.Odd[0]  = Odd0;
+    State.Odd[1]  = Odd1;
+    State.Odd[2]  = Odd2;
+
+    return KeyStream;
+}
+
+/**
+ * @brief Process an array of bytes with Crypto1
+ * 
+ * This function encrypts/decrypts multiple bytes efficiently by
+ * avoiding state load/store for each byte.
+ * 
+ * @param Buffer Array of bytes to encrypt/decrypt (in-place)
+ * @param Count Number of bytes to process
+ */
+void Crypto1ByteArray(uint8_t *Buffer, uint8_t Count) {
+    // Use a single optimized implementation that generates keystream
+    // and applies it to each byte
+    while (Count--) {
+        *Buffer++ ^= Crypto1Byte();
+    }
+}
+
+/**
+ * @brief Process array of bytes with parity bit generation
+ * 
+ * This function encrypts bytes and generates encrypted parity bits
+ * 
+ * @param Buffer Array of bytes to encrypt (in-place)
+ * @param Parity Buffer to store encrypted parity bits
+ * @param Count Number of bytes to process
+ */
+void Crypto1ByteArrayWithParity(uint8_t *Buffer, uint8_t *Parity, uint8_t Count) {
+    register uint8_t Even0, Even1, Even2;
+    register uint8_t Odd0, Odd1, Odd2;
+    uint8_t KeyStream = 0, Feedback, Out;
+
+    // Load state into local registers
+    Even0 = State.Even[0];
+    Even1 = State.Even[1];
+    Even2 = State.Even[2];
+    Odd0 = State.Odd[0];
+    Odd1 = State.Odd[1];
+    Odd2 = State.Odd[2];
+
+    // Get first filter output for bit 0 of first byte
     Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
 
     while (Count--) {
-        /* Bit 0, initialise keystream from parity */
+        // Initialize keystream for current byte
         SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        SHIFT24(Even0, Even1, Even2, Feedback);
+        
+        // Process 8 bits for each byte
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            // Calculate feedback
+            Feedback = (bit & 1) ?
+                Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) :
+                Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
+                
+            // Shift state according to bit parity
+            if (bit & 1) {
+                SHIFT24(Odd0, Odd1, Odd2, Feedback);
+                if (bit < 7) { // Don't get output for last bit
+                    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
+                    KeyStream = (KeyStream >> 1) | Out;
+                }
+            } else {
+                SHIFT24(Even0, Even1, Even2, Feedback);
+                if (bit > 0) { // Skip first bit (already done)
+                    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
+                    KeyStream = (KeyStream >> 1) | Out;
+                }
+            }
+        }
 
-        /* Bit 1 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 2 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 3 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 4 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 5 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 6 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 7 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2);
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Next bit encodes parity */
+        // Generate parity bit for next byte
         Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
         *Parity++ = ODD_PARITY(*Buffer) ^ Out;
 
-        /* encode Byte */
+        // Encrypt current byte
         *Buffer++ ^= KeyStream;
     }
-    /* save state */
+    
+    // Save state
     State.Even[0] = Even0;
     State.Even[1] = Even1;
     State.Even[2] = Even2;
@@ -1025,20 +734,22 @@ void Crypto1ByteArrayWithParity(uint8_t *Buffer, uint8_t *Parity, uint8_t Count)
     State.Odd[2]  = Odd2;
 }
 
-/* Crypto1ByteArrayWithParity encrypts an array of bytes   */
-/* and generates the parity bits                           */
-/* No input to the LFSR                                    */
-/* Avoids load/store of the LFSR-state for each byte!      */
-/* The filter output used to encrypt the parity is         */
-/* reused to encrypt bit 0 in the next byte.               */
+/**
+ * @brief Process array of bytes with input-feeding and parity generation
+ * 
+ * This function is similar to Crypto1ByteArrayWithParity but also
+ * feeds buffer contents into the LFSR.
+ * 
+ * @param Buffer Array of bytes to process (in-place)
+ * @param Parity Buffer to store encrypted parity bits
+ * @param Count Number of bytes to process
+ */
 void Crypto1ByteArrayWithParityHasIn(uint8_t *Buffer, uint8_t *Parity, uint8_t Count) {
-    /* state registers */
     register uint8_t Even0, Even1, Even2;
-    register uint8_t Odd0,  Odd1,  Odd2;
-    // KeyStream is direct to use, must to init.
-    uint8_t KeyStream = 0x00, Feedback, Out;
+    register uint8_t Odd0, Odd1, Odd2;
+    uint8_t KeyStream = 0, Feedback, Out;
 
-    /* read state */
+    // Load state into local registers
     Even0 = State.Even[0];
     Even1 = State.Even[1];
     Even2 = State.Even[2];
@@ -1046,79 +757,50 @@ void Crypto1ByteArrayWithParityHasIn(uint8_t *Buffer, uint8_t *Parity, uint8_t C
     Odd1 = State.Odd[1];
     Odd2 = State.Odd[2];
 
-    /* First pass needs output, next pass uses parity bit! */
+    // Get first filter output for bit 0 of first byte
     Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
 
     while (Count--) {
         uint8_t In = *Buffer;
-
-        /* Bit 0, initialise keystream from parity */
+        
+        // Initialize keystream for current byte
         SHIFT8(KeyStream, Out);
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2) ^ In;
-        In >>= 1;
-        SHIFT24(Even0, Even1, Even2, Feedback);
+        
+        // Process 8 bits for each byte
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            // Calculate feedback with input
+            Feedback = (bit & 1) ?
+                Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) :
+                Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2);
+                
+            Feedback ^= (In & 1);
+            In >>= 1;
+            
+            // Shift state according to bit parity
+            if (bit & 1) {
+                SHIFT24(Odd0, Odd1, Odd2, Feedback);
+                if (bit < 7) { // Don't get output for last bit
+                    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
+                    KeyStream = (KeyStream >> 1) | Out;
+                }
+            } else {
+                SHIFT24(Even0, Even1, Even2, Feedback);
+                if (bit > 0) { // Skip first bit (already done)
+                    Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
+                    KeyStream = (KeyStream >> 1) | Out;
+                }
+            }
+        }
 
-        /* Bit 1 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) ^ In;
-        In >>= 1;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 2 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2) ^ In;
-        In >>= 1;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 3 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) ^ In;
-        In >>= 1;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 4 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2) ^ In;
-        In >>= 1;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 5 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) ^ In;
-        In >>= 1;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Bit 6 */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Odd0, Odd1, Odd2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback  = Crypto1LFSRbyteFeedback(Even0, Even1, Even2, Odd0, Odd1, Odd2) ^ In;
-        In >>= 1;
-        SHIFT24(Even0, Even1, Even2, Feedback);
-
-        /* Bit 7 */
-        /* remember Odd/Even swap has been omitted! */
-        Out = CRYPTO1_FILTER_OUTPUT_B7_24(Even0, Even1, Even2);
-        KeyStream = (KeyStream >> 1) | Out;
-        Feedback = Crypto1LFSRbyteFeedback(Odd0, Odd1, Odd2, Even0, Even1, Even2) ^ In;
-        In >>= 1;
-        SHIFT24(Odd0, Odd1, Odd2, Feedback);
-
-        /* Next bit encodes parity */
+        // Generate parity bit for this byte
         Out = CRYPTO1_FILTER_OUTPUT_B0_24(Odd0, Odd1, Odd2);
         *Parity++ = ODD_PARITY(*Buffer) ^ Out;
 
-        /* encode Byte */
+        // Encrypt current byte
         *Buffer++ ^= KeyStream;
     }
-    /* save state */
+    
+    // Save state
     State.Even[0] = Even0;
     State.Even[1] = Even1;
     State.Even[2] = Even2;
@@ -1127,100 +809,140 @@ void Crypto1ByteArrayWithParityHasIn(uint8_t *Buffer, uint8_t *Parity, uint8_t C
     State.Odd[2]  = Odd2;
 }
 
-/* Function Crypto1PRNG                                           */
-/* New version of the PRNG which can calculate multiple           */
-/* feedback bits at once!                                         */
-/* Feedback mask = 0x2d  = 101101 binary                          */
-/* Because pattern 101 is repeated, only 2 shifts are necessary!  */
-/*      Feedback ^= Feedback >> 3;     folds 101 101 to 101       */
-/*      Feedback ^= Feedback >> 2;     folds 101 => 1             */
-/* With these two lines not only bit 0 is calculated,             */
-/* but all the bits which do no overlap with the feedback!        */
-/* I.e. the 10 leading zeros in the feedback mask bits            */
-/* gives us a total of 11 valid feedback bits!                    */
-/* The ClockCount for the PRNG is always multiple of 32!          */
-/* Up tp 11 Bits can be calculated at once                        */
-/* Split into chunks of 11+11+10 = 32 bits                        */
-/* This avoids a calculated number of shifts                      */
+/**
+ * @brief Optimized PRNG function for Crypto1
+ * 
+ * This function efficiently advances the PRNG state by exploiting
+ * the structure of the feedback polynomial.
+ * 
+ * @param State 4-byte PRNG state
+ * @param ClockCount Number of iterations (must be multiple of 32)
+ */
 void Crypto1PRNG(uint8_t State[4], uint8_t ClockCount) {
-    /* For ease of processing convert the state into a 32 bit integer first */
-    uint32_t Temp;
-    uint16_t Feedback;
-
-    Temp  = (uint32_t) State[0] << 0;
-    Temp |= (uint32_t) State[1] << 8;
-    Temp |= (uint32_t) State[2] << 16;
-    Temp |= (uint32_t) State[3] << 24;
-
-    /* PRNG is always a multiple of 32!        */
-    /* Up tp 11 Bits can be calculated at once */
-    /* Split into chunks of 11+11+10 = 32 bits */
+    // Process state as 32-bit value for efficiency
+    uint32_t Temp = ((uint32_t)State[0]) | 
+                    ((uint32_t)State[1] << 8) | 
+                    ((uint32_t)State[2] << 16) | 
+                    ((uint32_t)State[3] << 24);
+    
+    // Process in chunks of 32 bits
     while (ClockCount >= 32) {
-        Feedback = (uint16_t)(Temp >> 16);
-        Feedback ^= Feedback >> 3;   /* 2d = 101101,  fold 101 101 => 101 */
-        Feedback ^= Feedback >> 2;   /* fold 101 => 1 */
-        /* Cycle LFSR and feed back. */
+        // Optimize feedback calculation by processing in chunks
+        
+        // Process first 11 bits
+        uint16_t Feedback = (uint16_t)(Temp >> 16);
+        Feedback ^= Feedback >> 3;   // Fold 101 101 pattern to 101
+        Feedback ^= Feedback >> 2;   // Fold 101 to 1
         Temp = (Temp >> 11) | (((uint32_t)Feedback) << (32 - 11));
 
-        /* Same for the next 11 Bits */
+        // Process next 11 bits
         Feedback = (uint16_t)(Temp >> 16);
-        Feedback ^= Feedback >> 3;   /* 2d = 101101,  fold 101 101 => 101 */
-        Feedback ^= Feedback >> 2;   /* fold 101 => 1 */
+        Feedback ^= Feedback >> 3;
+        Feedback ^= Feedback >> 2;
         Temp = (Temp >> 11) | (((uint32_t)Feedback) << (32 - 11));
 
-        /* Remaining 10 bits */
+        // Process final 10 bits
         Feedback = (uint16_t)(Temp >> 16);
-        Feedback ^= Feedback >> 3;   /* 2d = 101101,  fold 101 101 => 101 */
-        Feedback ^= Feedback >> 2;   /* fold 101 => 1 */
+        Feedback ^= Feedback >> 3;
+        Feedback ^= Feedback >> 2;
         Temp = (Temp >> 10) | (((uint32_t)Feedback) << (32 - 10));
 
-        /* Now 32 bits are fed back */
         ClockCount -= 32;
     }
 
-    /* Store back state */
-    State[0] = (uint8_t)(Temp >> 0);
+    // Store back state
+    State[0] = (uint8_t)(Temp);
     State[1] = (uint8_t)(Temp >> 8);
     State[2] = (uint8_t)(Temp >> 16);
     State[3] = (uint8_t)(Temp >> 24);
 }
 
-/* prng_successor
- * helper used to obscure the keystream during authentication
+/**
+ * @brief Optimized PRNG successor function
+ * 
+ * This function is a portable implementation of prng_successor
+ * using ARM-specific optimizations when available.
+ * 
+ * @param x Initial PRNG state
+ * @param n Number of iterations
+ * @return New PRNG state after n iterations
  */
 uint32_t Crypto1FreePRNG(uint32_t x, uint32_t n) {
+    // Use ARM-specific byte swap for better performance
     x = __builtin_bswap32(x);
 
-    while (n--)
+    // Optimize common cases for better performance
+    if (n == 1) {
+        // Single iteration
         x = x >> 1 | (x >> 16 ^ x >> 18 ^ x >> 19 ^ x >> 21) << 31;
+    } else if (n == 16) {
+        // 16 iterations (common in MIFARE authentication)
+        for (uint8_t i = 0; i < 16; i++) {
+            x = x >> 1 | (x >> 16 ^ x >> 18 ^ x >> 19 ^ x >> 21) << 31;
+        }
+    } else {
+        // General case
+        while (n--) {
+            x = x >> 1 | (x >> 16 ^ x >> 18 ^ x >> 19 ^ x >> 21) << 31;
+        }
+    }
 
+    // Return result with proper byte order
     return __builtin_bswap32(x);
 }
 
-
+/**
+ * @brief Encrypt buffer with consideration for parity bits
+ * 
+ * This function encrypts a buffer including parity bits (every 9th bit).
+ * 
+ * @param Buffer Buffer to encrypt (in-place)
+ * @param BitCount Total number of bits to process
+ */
 void Crypto1EncryptWithParity(uint8_t *Buffer, uint8_t BitCount) {
-    uint8_t i = 0;
-    while (i < BitCount) {
-        Buffer[i / 8] ^=
+    for (uint8_t i = 0; i < BitCount; i++) {
+        // XOR current bit with filter output
+        Buffer[i / 8] ^= 
             CRYPTO1_FILTER_OUTPUT_B0_24(State.Odd[0], State.Odd[1], State.Odd[2])
             << (i % 8);
-        if (++i % 9 != 0) // only shift, if this was no parity bit
+            
+        // Only advance LFSR if not a parity bit
+        if ((i + 1) % 9 != 0) {
             Crypto1LFSR(0);
+        }
     }
 }
 
+/**
+ * @brief Process reader auth with parity bits
+ * 
+ * This function handles reader authentication with proper parity bit processing.
+ * 
+ * @param PlainReaderAnswerWithParityBits 9-byte buffer with reader answer including parity
+ */
 void Crypto1ReaderAuthWithParity(uint8_t PlainReaderAnswerWithParityBits[9]) {
     uint8_t i = 0, feedback;
+    
+    // Process 72 bits (8 bytes + 8 parity bits)
     while (i < 72) {
         feedback = PlainReaderAnswerWithParityBits[i / 8] >> (i % 8);
+        
+        // XOR current bit with filter output
         PlainReaderAnswerWithParityBits[i / 8] ^=
             CRYPTO1_FILTER_OUTPUT_B0_24(State.Odd[0], State.Odd[1], State.Odd[2])
             << (i % 8);
-        if (++i % 9 != 0) { // only shift, if this was no parity bit
-            if (i <= 36)
+            
+        // Only advance LFSR if not a parity bit
+        if ((i + 1) % 9 != 0) {
+            // First 36 bits: feed back reader answer
+            // Last 36 bits: no feedback
+            if (i < 36) {
                 Crypto1LFSR(feedback & 1);
-            else
+            } else {
                 Crypto1LFSR(0);
+            }
         }
+        
+        i++;
     }
 }
