@@ -9,8 +9,8 @@ assignees: ''
 
 ***Things to try before submitting a bug report***
 
-* read the [troubleshooting guide](https://github.com/RfidResearchGroup/ChameleonUltra/blob/main/docs/troubleshooting.md)
-* check existing [issues](https://github.com/RfidResearchGroup/ChameleonUltra/issues)
+* read the [troubleshooting guide](https://github.com/ChameleonUltra/ChameleonUltra/wiki/troubleshooting)
+* check existing [issues](https://github.com/ChameleonUltra/ChameleonUltra/issues)
 * use the latest firmware and CLI
 * for issues specific to another client than the Python CLI, use the corresponding issue tracker. E.g. [here](https://github.com/GameTec-live/ChameleonUltraGUI/issues) for the ChameleonUltraGUI
 

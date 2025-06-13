@@ -9,7 +9,7 @@ assignees: ''
 
 Please keep in mind we are still at the infancy of the project and a lot has still to be done.
 
-Have first a look at the [Whitepaper](https://github.com/RfidResearchGroup/ChameleonUltra/blob/main/docs/technical_whitepaper.md), the Wiki [Roadmap](https://github.com/RfidResearchGroup/ChameleonUltra/wiki/Public-Roadmap) and [Wishlist](https://github.com/RfidResearchGroup/ChameleonUltra/wiki/Wishlist).  
+Have first a look at the [Whitepaper](https://github.com/ChameleonUltra/ChameleonUltra/wiki/technical_whitepaper), the Wiki [Roadmap](https://github.com/ChameleonUltra/ChameleonUltra/wiki/Public-Roadmap) and [Wishlist](https://github.com/ChameleonUltra/ChameleonUltra/wiki/Wishlist).  
 No need for creating issues for well known missing supports, we are already aware :)
 
 **Is your feature request related to a problem? Please describe.**

@@ -28,6 +28,7 @@ Read the [available documentation](https://github.com/ChameleonUltra/ChameleonUl
 
 * [ChameleonUltraGUI](https://github.com/GameTec-live/ChameleonUltraGUI)
 * [MTools BLE](https://github.com/ChameleonUltra/ChameleonUltra/wiki/mtoolsble)
+* [taichunmin JS SDK](https://github.com/taichunmin/chameleon-ultra.js)
 
 # Videos
 
