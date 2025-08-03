@@ -1,6 +1,10 @@
 on: pull_request_target
 name: Changelog Reminder
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   welcome:
     runs-on: ubuntu-latest
